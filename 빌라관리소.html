@@ -367,6 +367,9 @@
     opacity:0;
     pointer-events:none;
     transition:opacity .2s ease;
+    max-width:85%;
+    text-align:center;
+    word-break:break-word;
     z-index:50;
   }
   .toast.show{opacity:1;}
@@ -478,18 +481,28 @@ function findZone(dong){ return ZONES.find(z=>z.dong===dong); }
 const KAKAO_REST_KEY = '4f07d9b7ee95c20ee316f0ea9be01874';
 let zoneCoordsCache = {};
 
+let lastGeocodeError = null;
 async function geocodeAddress(query){
   try{
     const res = await fetch(`https://dapi.kakao.com/v2/local/search/address.json?query=${encodeURIComponent(query)}`, {
       headers: { Authorization: `KakaoAK ${KAKAO_REST_KEY}` }
     });
-    if(!res.ok) return null;
+    if(!res.ok){
+      let bodyText = '';
+      try{ bodyText = await res.text(); }catch(e2){}
+      lastGeocodeError = `HTTP ${res.status} ${bodyText.slice(0,120)}`;
+      return null;
+    }
     const data = await res.json();
     if(data.documents && data.documents.length > 0){
       const d = data.documents[0];
+      lastGeocodeError = null;
       return { lat: parseFloat(d.y), lng: parseFloat(d.x) };
     }
-  }catch(e){}
+    lastGeocodeError = '검색 결과 없음';
+  }catch(e){
+    lastGeocodeError = '네트워크 오류: ' + e.message;
+  }
   return null;
 }
 
@@ -525,9 +538,9 @@ async function findMyZone(){
   showToast('찾는 중...');
   await ensureZoneCoords();
   const userCoords = await geocodeAddress('서울 강북구 ' + q);
-  if(!userCoords){ showToast('주소를 찾지 못했어요. 다시 확인해주세요'); return; }
+  if(!userCoords){ showToast('실패: ' + (lastGeocodeError || '알 수 없는 오류'), 7000); return; }
   const nearest = findNearestZone(userCoords);
-  if(!nearest){ showToast('구역을 추천하지 못했어요'); return; }
+  if(!nearest){ showToast('구역 좌표 준비 실패: ' + (lastGeocodeError || ''), 7000); return; }
   residentZone = nearest;
   showToast(`${nearest} 구역으로 추정돼요`);
   render();
@@ -588,11 +601,11 @@ auth.onAuthStateChanged((user)=>{
   render();
 });
 
-function showToast(msg){
+function showToast(msg, duration){
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
-  setTimeout(()=>t.classList.remove('show'), 1800);
+  setTimeout(()=>t.classList.remove('show'), duration || 1800);
 }
 
 function setRole(r){
