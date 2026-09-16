@@ -9,6 +9,7 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <meta name="theme-color" content="#0b4ea2">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="빌라관리소">
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
@@ -503,8 +504,23 @@ let myComplaintIds = [];
 let activity = [];
 let loaded = false;
 let residentProfile = { name:'', phone:'', unit:'', consent:false };
+try{
+  const savedProfile = JSON.parse(localStorage.getItem('residentProfile') || 'null');
+  if(savedProfile && typeof savedProfile === 'object'){
+    residentProfile = {
+      name: typeof savedProfile.name === 'string' ? savedProfile.name : '',
+      phone: typeof savedProfile.phone === 'string' ? savedProfile.phone : '',
+      unit: typeof savedProfile.unit === 'string' ? savedProfile.unit : '',
+      consent: savedProfile.consent === true
+    };
+  }
+}catch(e){}
 let lastReceipt = null;
 let residentZone = '';
+try{
+  const savedZone = localStorage.getItem('residentZone');
+  if(savedZone && typeof savedZone === 'string') residentZone = savedZone;
+}catch(e){}
 let managerZone = ZONES[0].dong;
 
 function findZone(dong){ return ZONES.find(z=>z.dong===dong); }
@@ -574,6 +590,7 @@ async function findMyZone(){
   const nearest = findNearestZone(userCoords);
   if(!nearest){ showToast('구역 좌표 준비 실패: ' + (lastGeocodeError || ''), 7000); return; }
   residentZone = nearest;
+  try{ localStorage.setItem('residentZone', nearest); }catch(e){}
   showToast(`${nearest} 구역으로 추정돼요`);
   render();
 }
@@ -614,7 +631,7 @@ function watchMyComplaint(id){
     myComplaints.sort((a,b)=> b.createdAt - a.createdAt);
     loaded = true;
     render();
-  }, (err)=>{ loaded = true; });
+  }, (err)=>{ loaded = true; showToast('민원 조회 중 오류: ' + err.message, 5000); });
 }
 myComplaintIds.forEach(watchMyComplaint);
 loaded = true;
@@ -756,8 +773,17 @@ async function handlePhotoSelect(e){
   const remain = MAX_PHOTOS - pendingPhotos.length;
   const files = Array.from(e.target.files).slice(0, remain);
   for(const f of files){
-    try{ pendingPhotos.push(await resizeImageFile(f)); }catch(err){}
+    if(!f.type || !f.type.startsWith('image/')){
+      showToast(`${f.name}은(는) 이미지 파일이 아니에요`);
+      continue;
+    }
+    if(f.size > 15 * 1024 * 1024){
+      showToast(`${f.name} 파일이 너무 커요 (15MB 이하만 가능)`);
+      continue;
+    }
+    try{ pendingPhotos.push(await resizeImageFile(f)); }catch(err){ showToast('사진을 처리하지 못했어요'); }
   }
+  e.target.value = '';
   render();
 }
 function removePendingPhoto(idx){ pendingPhotos.splice(idx,1); render(); }
@@ -932,7 +958,7 @@ function renderResident(){
         </div>
         <label style="display:flex; align-items:flex-start; gap:8px; font-size:12px; color:var(--muted); font-weight:400; margin-bottom:12px; cursor:pointer;">
           <input type="checkbox" id="profileConsent" ${residentProfile.consent?'checked':''} style="width:auto; margin-top:2px;">
-          <span>민원 접수·처리 목적으로 이름·전화번호·주소를 수집하는 데 동의합니다. (처리 완료 후 일정 기간 뒤 파기)</span>
+          <span>민원 접수·처리 목적으로 이름·전화번호·주소를 수집하는 데 동의합니다. 입력하신 정보는 이 기기에 저장되고, 민원 접수 시 서버에도 함께 전달돼요. (보관기간 등 세부 정책은 강북구청 담당자가 별도로 안내합니다)</span>
         </label>
         <button class="btn secondary small" onclick="saveProfile()">저장</button>
         <div style="font-size:12px; color:var(--muted); margin-top:8px;">등록해두면 민원 접수 시 자동으로 입력돼요.</div>
@@ -1014,11 +1040,28 @@ function renderResident(){
       </div>
     ` +
       (list.length===0 ? '<div class="empty">조회된 민원이 없어요.</div>' :
-      list.map(complaintItemHtml).join(''));
+      list.map(complaintItemHtml).join('')) +
+      (list.length>0 ? `
+        <div style="text-align:center; margin-top:14px;">
+          <button class="btn-danger" onclick="forgetThisDevice()">이 기기에서 민원 기록 지우기</button>
+        </div>
+        <div class="hint" style="text-align:center; margin-top:6px;">공용 PC·다른 사람 폰이었다면 눌러주세요. 접수번호와 비밀번호만 알면 나중에도 다시 조회할 수 있어요.</div>
+      ` : '');
   }
 }
 
 function dismissReceipt(){ lastReceipt = null; render(); }
+
+function forgetThisDevice(){
+  if(!confirm('이 기기에 저장된 민원 기록을 전부 지울까요? (실제 민원은 그대로 남아있고, 접수번호+비밀번호로 언제든 다시 조회할 수 있어요)')) return;
+  Object.values(myComplaintUnsubs).forEach(unsub => unsub());
+  Object.keys(myComplaintUnsubs).forEach(k => delete myComplaintUnsubs[k]);
+  myComplaintIds = [];
+  myComplaints = [];
+  try{ localStorage.removeItem('myComplaintIds'); }catch(e){}
+  showToast('이 기기의 민원 기록을 지웠어요');
+  render();
+}
 
 async function lookupComplaint(){
   const code = document.getElementById('lookupCode').value.trim().toUpperCase();
@@ -1100,7 +1143,11 @@ async function cancelComplaint(id){
 function selectComplaintCategory(c){ selectedComplaintCategory = c; render(); }
 function selectTaskCategory(c){ selectedTaskCategory = c; render(); }
 
-function setResidentZone(z){ residentZone = z; render(); }
+function setResidentZone(z){
+  residentZone = z;
+  try{ localStorage.setItem('residentZone', z); }catch(e){}
+  render();
+}
 
 function saveProfile(){
   const name = document.getElementById('profileName').value.trim();
@@ -1109,8 +1156,9 @@ function saveProfile(){
   const consent = document.getElementById('profileConsent').checked;
   if(!consent){ showToast('개인정보 수집·이용에 동의해주세요'); return; }
   residentProfile = { name, phone, unit, consent };
+  try{ localStorage.setItem('residentProfile', JSON.stringify(residentProfile)); }catch(e){}
   render();
-  showToast('등록되었어요');
+  showToast('이 기기에 저장했어요');
 }
 
 function genReceiptCode(){
@@ -1201,6 +1249,7 @@ async function submitComplaint(){
     complaintDraft = { unit:'', title:'', content:'', pin:'', date:'', timeSlot:'' };
     if(unit) residentProfile.unit = unit;
     residentZone = zone;
+    try{ localStorage.setItem('residentZone', zone); }catch(e){}
     lastReceipt = { code, pin };
     showToast('민원이 접수되었어요');
     residentTab = 'mine';
@@ -1326,9 +1375,20 @@ async function updateStatus(id, status){
       return;
     }
   }
+  let reasonUpdate = {};
+  if(status === '반려'){
+    const textarea = document.getElementById(`reply-${id}`);
+    const currentReply = textarea ? textarea.value.trim() : '';
+    if(!currentReply){
+      const reason = prompt('반려 사유를 입력해주세요. (입주민에게 그대로 안내돼요)');
+      if(!reason || !reason.trim()){ showToast('반려하려면 사유를 입력해야 해요'); render(); return; }
+      reasonUpdate = { reply: reason.trim() };
+    }
+  }
   try{
     await db.collection('complaints').doc(id).update({
       status,
+      ...reasonUpdate,
       statusHistory: firebase.firestore.FieldValue.arrayUnion({ status, at: Date.now() })
     });
     showToast('상태가 변경되었어요');
