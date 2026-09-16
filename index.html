@@ -14,6 +14,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@700&family=Pretendard:wght@400;500;600;700&display=swap');
 
@@ -487,6 +488,7 @@ const SERVICES = {
 };
 let expandedService = null;
 let pendingPhotos = [];
+let complaintDraft = { unit:'', title:'', content:'', pin:'', date:'', timeSlot:'' };
 const MAX_PHOTOS = 2;
 
 let role = 'resident';
@@ -501,8 +503,23 @@ let myComplaintIds = [];
 let activity = [];
 let loaded = false;
 let residentProfile = { name:'', phone:'', unit:'', consent:false };
+try{
+  const savedProfile = JSON.parse(localStorage.getItem('residentProfile') || 'null');
+  if(savedProfile && typeof savedProfile === 'object'){
+    residentProfile = {
+      name: typeof savedProfile.name === 'string' ? savedProfile.name : '',
+      phone: typeof savedProfile.phone === 'string' ? savedProfile.phone : '',
+      unit: typeof savedProfile.unit === 'string' ? savedProfile.unit : '',
+      consent: savedProfile.consent === true
+    };
+  }
+}catch(e){}
 let lastReceipt = null;
 let residentZone = '';
+try{
+  const savedZone = localStorage.getItem('residentZone');
+  if(savedZone && typeof savedZone === 'string') residentZone = savedZone;
+}catch(e){}
 let managerZone = ZONES[0].dong;
 
 function findZone(dong){ return ZONES.find(z=>z.dong===dong); }
@@ -537,8 +554,8 @@ async function geocodeAddress(query){
 }
 
 async function ensureZoneCoords(){
-  if(Object.keys(zoneCoordsCache).length > 0) return;
-  for(const z of ZONES){
+  const missing = ZONES.filter(z => !zoneCoordsCache[z.dong]);
+  for(const z of missing){
     const coords = await geocodeAddress('서울 강북구 ' + z.addr);
     if(coords) zoneCoordsCache[z.dong] = coords;
   }
@@ -572,6 +589,7 @@ async function findMyZone(){
   const nearest = findNearestZone(userCoords);
   if(!nearest){ showToast('구역 좌표 준비 실패: ' + (lastGeocodeError || ''), 7000); return; }
   residentZone = nearest;
+  try{ localStorage.setItem('residentZone', nearest); }catch(e){}
   showToast(`${nearest} 구역으로 추정돼요`);
   render();
 }
@@ -589,22 +607,30 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
+const storage = firebase.storage();
 
 // 입주민: 로컬(이 기기)에 저장해둔 내 민원 ID만 하나씩 개별 조회 (전체 목록 조회 권한 없음)
 try{
-  myComplaintIds = JSON.parse(localStorage.getItem('myComplaintIds') || '[]');
+  const parsed = JSON.parse(localStorage.getItem('myComplaintIds') || '[]');
+  myComplaintIds = Array.isArray(parsed) ? parsed.filter(x => typeof x === 'string') : [];
 }catch(e){ myComplaintIds = []; }
 
+const myComplaintUnsubs = {};
 function watchMyComplaint(id){
-  db.collection('complaints').doc(id).onSnapshot((doc)=>{
-    if(!doc.exists) return;
+  if(myComplaintUnsubs[id]) return; // 이미 구독 중이면 중복 구독하지 않음
+  myComplaintUnsubs[id] = db.collection('complaints').doc(id).onSnapshot((doc)=>{
+    if(!doc.exists){
+      myComplaints = myComplaints.filter(c => c.id !== id);
+      render();
+      return;
+    }
     const data = { id: doc.id, ...doc.data() };
     const idx = myComplaints.findIndex(c=>c.id===id);
     if(idx>=0) myComplaints[idx] = data; else myComplaints.push(data);
     myComplaints.sort((a,b)=> b.createdAt - a.createdAt);
     loaded = true;
     render();
-  }, (err)=>{ loaded = true; });
+  }, (err)=>{ loaded = true; showToast('민원 조회 중 오류: ' + err.message, 5000); });
 }
 myComplaintIds.forEach(watchMyComplaint);
 loaded = true;
@@ -612,16 +638,31 @@ loaded = true;
 // 매니저: 로그인 상태일 때만 전체 목록 구독 (Firestore 규칙: list는 인증된 사용자만 허용)
 let unsubManagerComplaints = null;
 let unsubActivity = null;
-auth.onAuthStateChanged((user)=>{
+auth.onAuthStateChanged(async (user)=>{
   if(user){
-    unsubManagerComplaints = db.collection('complaints').orderBy('createdAt','desc').onSnapshot((snap)=>{
-      managerComplaints = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      render();
-    }, (err)=>{});
-    unsubActivity = db.collection('activity').orderBy('timestamp','desc').onSnapshot((snap)=>{
-      activity = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      render();
-    }, (err)=>{});
+    let profileZone = null;
+    try{
+      const profDoc = await db.collection('managers').doc(user.uid).get();
+      if(profDoc.exists) profileZone = profDoc.data().zone;
+    }catch(e){}
+    if(!profileZone){
+      showToast('이 계정에 담당 구역이 설정되어 있지 않아요. 관리자에게 문의해주세요.', 6000);
+      auth.signOut();
+      return;
+    }
+    managerZone = profileZone;
+    unsubManagerComplaints = db.collection('complaints')
+      .where('zone','==',managerZone).orderBy('createdAt','desc').limit(500)
+      .onSnapshot((snap)=>{
+        managerComplaints = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        render();
+      }, (err)=>{ showToast('민원 목록 불러오기 실패: '+err.message, 6000); });
+    unsubActivity = db.collection('activity')
+      .where('zone','==',managerZone).orderBy('timestamp','desc').limit(300)
+      .onSnapshot((snap)=>{
+        activity = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        render();
+      }, (err)=>{});
   }else{
     if(unsubManagerComplaints) unsubManagerComplaints();
     if(unsubActivity) unsubActivity();
@@ -679,17 +720,16 @@ async function managerLogin(){
   }
 }
 
-function managerLogout(){
-  auth.signOut();
-  showToast('로그아웃되었어요');
+async function managerLogout(){
+  try{
+    await auth.signOut();
+    showToast('로그아웃되었어요');
+  }catch(e){
+    showToast('로그아웃에 실패했어요');
+  }
 }
 
 
-function latestOf(type, zone){
-  const items = activity.filter(a=>a.type===type && a.zone===zone);
-  if(items.length===0) return null;
-  return items[items.length-1];
-}
 function timeAgo(ts){
   const d = new Date(ts);
   return d.getMonth()+1 + '/' + d.getDate() + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
@@ -698,6 +738,9 @@ function escapeHtml(s){
   const d = document.createElement('div');
   d.textContent = s || '';
   return d.innerHTML;
+}
+function escapeAttr(s){
+  return escapeHtml(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function zoneOptionsHtml(selected){
   return `<option value="" ${!selected?'selected':''}>구역을 선택하세요</option>` +
@@ -729,8 +772,17 @@ async function handlePhotoSelect(e){
   const remain = MAX_PHOTOS - pendingPhotos.length;
   const files = Array.from(e.target.files).slice(0, remain);
   for(const f of files){
-    try{ pendingPhotos.push(await resizeImageFile(f)); }catch(err){}
+    if(!f.type || !f.type.startsWith('image/')){
+      showToast(`${f.name}은(는) 이미지 파일이 아니에요`);
+      continue;
+    }
+    if(f.size > 15 * 1024 * 1024){
+      showToast(`${f.name} 파일이 너무 커요 (15MB 이하만 가능)`);
+      continue;
+    }
+    try{ pendingPhotos.push(await resizeImageFile(f)); }catch(err){ showToast('사진을 처리하지 못했어요'); }
   }
+  e.target.value = '';
   render();
 }
 function removePendingPhoto(idx){ pendingPhotos.splice(idx,1); render(); }
@@ -811,7 +863,10 @@ function renderTabbar(){
   }
 }
 function setResidentTab(t){
-  if(t === 'new' && residentTab !== 'new'){ pendingPhotos = []; }
+  if(t === 'new' && residentTab !== 'new'){
+    pendingPhotos = [];
+    complaintDraft = { unit: residentProfile.unit || '', title:'', content:'', pin:'', date:'', timeSlot:'' };
+  }
   residentTab = t;
   render();
 }
@@ -890,19 +945,19 @@ function renderResident(){
       <div class="card">
         <div class="form-group">
           <label>이름</label>
-          <input type="text" id="profileName" placeholder="홍길동" value="${escapeHtml(residentProfile.name)}">
+          <input type="text" id="profileName" placeholder="홍길동" value="${escapeAttr(residentProfile.name)}">
         </div>
         <div class="form-group">
           <label>전화번호</label>
-          <input type="text" id="profilePhone" placeholder="010-0000-0000" value="${escapeHtml(residentProfile.phone)}">
+          <input type="text" id="profilePhone" placeholder="010-0000-0000" value="${escapeAttr(residentProfile.phone)}">
         </div>
         <div class="form-group" style="margin-bottom:12px;">
           <label>주소 (동/호수)</label>
-          <input type="text" id="profileUnit" placeholder="예: 3동 201호" value="${escapeHtml(residentProfile.unit)}">
+          <input type="text" id="profileUnit" placeholder="예: 3동 201호" value="${escapeAttr(residentProfile.unit)}">
         </div>
         <label style="display:flex; align-items:flex-start; gap:8px; font-size:12px; color:var(--muted); font-weight:400; margin-bottom:12px; cursor:pointer;">
           <input type="checkbox" id="profileConsent" ${residentProfile.consent?'checked':''} style="width:auto; margin-top:2px;">
-          <span>민원 접수·처리 목적으로 이름·전화번호·주소를 수집하는 데 동의합니다. (처리 완료 후 일정 기간 뒤 파기)</span>
+          <span>민원 접수·처리 목적으로 이름·전화번호·주소를 수집하는 데 동의합니다. 입력하신 정보는 이 기기에 저장되고, 민원 접수 시 서버에도 함께 전달돼요. (보관기간 등 세부 정책은 강북구청 담당자가 별도로 안내합니다)</span>
         </label>
         <button class="btn secondary small" onclick="saveProfile()">저장</button>
         <div style="font-size:12px; color:var(--muted); margin-top:8px;">등록해두면 민원 접수 시 자동으로 입력돼요.</div>
@@ -925,20 +980,20 @@ function renderResident(){
         </div>
         <div class="form-group">
           <label>동/호수</label>
-          <input type="text" id="cUnit" placeholder="예: 3동 201호" value="${escapeHtml(residentProfile.unit)}">
+          <input type="text" id="cUnit" placeholder="예: 3동 201호" value="${escapeAttr(complaintDraft.unit)}" oninput="complaintDraft.unit=this.value">
         </div>
         <div class="form-group">
           <label>확인용 비밀번호 (숫자 4자리)</label>
-          <input type="text" id="cPin" inputmode="numeric" maxlength="4" placeholder="예: 1234">
+          <input type="text" id="cPin" inputmode="numeric" maxlength="4" placeholder="예: 1234" value="${escapeAttr(complaintDraft.pin)}" oninput="complaintDraft.pin=this.value">
           <div class="hint" style="margin-top:6px;">나중에 접수번호와 이 비밀번호로 내 민원을 조회할 수 있어요. 꼭 기억해주세요.</div>
         </div>
         <div class="form-group">
           <label>제목</label>
-          <input type="text" id="cTitle" placeholder="예: ${TITLE_EXAMPLES[selectedComplaintCategory] || '제목을 입력해주세요'}">
+          <input type="text" id="cTitle" placeholder="예: ${TITLE_EXAMPLES[selectedComplaintCategory] || '제목을 입력해주세요'}" value="${escapeAttr(complaintDraft.title)}" oninput="complaintDraft.title=this.value">
         </div>
         <div class="form-group">
           <label>내용</label>
-          <textarea id="cContent" placeholder="자세한 상황을 적어주세요"></textarea>
+          <textarea id="cContent" placeholder="자세한 상황을 적어주세요" oninput="complaintDraft.content=this.value">${escapeHtml(complaintDraft.content)}</textarea>
         </div>
         <div class="form-group">
           <label>사진 첨부 (선택, 최대 ${MAX_PHOTOS}장)</label>
@@ -948,17 +1003,17 @@ function renderResident(){
         <div class="form-group">
           <label>희망 방문 시간 (선택)</label>
           <div style="display:flex; gap:8px;">
-            <input type="date" id="cDate" style="flex:1;">
-            <select id="cTimeSlot" style="flex:1;">
-              <option value="">시간대 무관</option>
-              <option>오전 (07:00~12:00)</option>
-              <option>오후 (12:00~15:00)</option>
-              <option>늦은 오후 (15:00~18:00)</option>
+            <input type="date" id="cDate" style="flex:1;" value="${escapeAttr(complaintDraft.date)}" oninput="complaintDraft.date=this.value">
+            <select id="cTimeSlot" style="flex:1;" onchange="complaintDraft.timeSlot=this.value">
+              <option value="" ${complaintDraft.timeSlot===''?'selected':''}>시간대 무관</option>
+              <option ${complaintDraft.timeSlot==='오전 (07:00~12:00)'?'selected':''}>오전 (07:00~12:00)</option>
+              <option ${complaintDraft.timeSlot==='오후 (12:00~15:00)'?'selected':''}>오후 (12:00~15:00)</option>
+              <option ${complaintDraft.timeSlot==='늦은 오후 (15:00~18:00)'?'selected':''}>늦은 오후 (15:00~18:00)</option>
             </select>
           </div>
           <div class="hint" style="margin-top:6px;">운영시간(평일 07:00~18:00) 내에서 희망하시는 시간을 남겨주시면 참고해서 방문할게요.</div>
         </div>
-        <button class="btn" onclick="submitComplaint()">접수하기</button>
+        <button class="btn" id="submitBtn" onclick="submitComplaint()">접수하기</button>
       </div>
     `;
   } else {
@@ -984,11 +1039,28 @@ function renderResident(){
       </div>
     ` +
       (list.length===0 ? '<div class="empty">조회된 민원이 없어요.</div>' :
-      list.map(complaintItemHtml).join(''));
+      list.map(complaintItemHtml).join('')) +
+      (list.length>0 ? `
+        <div style="text-align:center; margin-top:14px;">
+          <button class="btn-danger" onclick="forgetThisDevice()">이 기기에서 민원 기록 지우기</button>
+        </div>
+        <div class="hint" style="text-align:center; margin-top:6px;">공용 PC·다른 사람 폰이었다면 눌러주세요. 접수번호와 비밀번호만 알면 나중에도 다시 조회할 수 있어요.</div>
+      ` : '');
   }
 }
 
 function dismissReceipt(){ lastReceipt = null; render(); }
+
+function forgetThisDevice(){
+  if(!confirm('이 기기에 저장된 민원 기록을 전부 지울까요? (실제 민원은 그대로 남아있고, 접수번호+비밀번호로 언제든 다시 조회할 수 있어요)')) return;
+  Object.values(myComplaintUnsubs).forEach(unsub => unsub());
+  Object.keys(myComplaintUnsubs).forEach(k => delete myComplaintUnsubs[k]);
+  myComplaintIds = [];
+  myComplaints = [];
+  try{ localStorage.removeItem('myComplaintIds'); }catch(e){}
+  showToast('이 기기의 민원 기록을 지웠어요');
+  render();
+}
 
 async function lookupComplaint(){
   const code = document.getElementById('lookupCode').value.trim().toUpperCase();
@@ -1011,15 +1083,6 @@ function formatPhone(p){
   return p.replace(/(\d{3})(\d{3,4})(\d{4})/, '$1-$2-$3');
 }
 
-function statusCardHtml(icon, label, latest){
-  const cls = latest ? 'done' : 'pending';
-  const val = latest ? timeAgo(latest.timestamp) + (latest.note ? ' · '+latest.note : '') : '기록 없음';
-  return `<div class="status-card ${cls}">
-    <div class="icon">${icon}</div>
-    <div class="label">${label}</div>
-    <div class="val">${val}</div>
-  </div>`;
-}
 
 function statusTrackerHtml(status){
   if(status === '반려'){
@@ -1046,7 +1109,7 @@ function complaintItemHtml(c){
       <div>
         <div class="cat">${c.category}${c.zone ? ' · '+c.zone : ''}</div>
         <div class="title">${escapeHtml(c.title)}</div>
-        <div class="unit">${c.unit || ''}</div>
+        <div class="unit">${escapeHtml(c.unit || '')}</div>
         <div class="unit">🕒 접수 ${timeAgo(c.createdAt)}</div>
       </div>
       <span class="badge ${c.status}">${c.status}</span>
@@ -1068,7 +1131,10 @@ async function cancelComplaint(id){
     if(!doc.exists){ showToast('민원을 찾을 수 없어요'); return; }
     if(doc.data().pin !== pin){ showToast('비밀번호가 일치하지 않아요'); return; }
     if(!confirm('정말 이 민원을 취소할까요?')) return;
-    await db.collection('complaints').doc(id).update({ status: '취소' });
+    await db.collection('complaints').doc(id).update({
+      status: '취소',
+      statusHistory: firebase.firestore.FieldValue.arrayUnion({ status:'취소', at: Date.now() })
+    });
     showToast('민원이 취소되었어요');
   }catch(e){ showToast('취소에 실패했어요'); }
 }
@@ -1076,7 +1142,11 @@ async function cancelComplaint(id){
 function selectComplaintCategory(c){ selectedComplaintCategory = c; render(); }
 function selectTaskCategory(c){ selectedTaskCategory = c; render(); }
 
-function setResidentZone(z){ residentZone = z; render(); }
+function setResidentZone(z){
+  residentZone = z;
+  try{ localStorage.setItem('residentZone', z); }catch(e){}
+  render();
+}
 
 function saveProfile(){
   const name = document.getElementById('profileName').value.trim();
@@ -1085,8 +1155,9 @@ function saveProfile(){
   const consent = document.getElementById('profileConsent').checked;
   if(!consent){ showToast('개인정보 수집·이용에 동의해주세요'); return; }
   residentProfile = { name, phone, unit, consent };
+  try{ localStorage.setItem('residentProfile', JSON.stringify(residentProfile)); }catch(e){}
   render();
-  showToast('등록되었어요');
+  showToast('이 기기에 저장했어요');
 }
 
 function genReceiptCode(){
@@ -1096,7 +1167,20 @@ function genReceiptCode(){
   return code;
 }
 
+let isSubmitting = false;
+
+async function uploadPhotos(code, dataUrls){
+  const urls = [];
+  for(let i=0; i<dataUrls.length; i++){
+    const ref = storage.ref().child(`complaints/${code}/photo${i}.jpg`);
+    await ref.putString(dataUrls[i], 'data_url');
+    urls.push(await ref.getDownloadURL());
+  }
+  return urls;
+}
+
 async function submitComplaint(){
+  if(isSubmitting) return;
   const zone = document.getElementById('cZone').value;
   const unit = document.getElementById('cUnit').value.trim();
   const pin = document.getElementById('cPin').value.trim();
@@ -1107,33 +1191,73 @@ async function submitComplaint(){
   if(!zone){ showToast('구역을 선택해주세요'); return; }
   if(!title || !content){ showToast('제목과 내용을 입력해주세요'); return; }
   if(!/^\d{4}$/.test(pin)){ showToast('비밀번호 4자리 숫자를 입력해주세요'); return; }
+  if(title.length > 100){ showToast('제목은 100자 이내로 입력해주세요'); return; }
+  if(content.length > 2000){ showToast('내용은 2000자 이내로 입력해주세요'); return; }
+  const hasPersonalInfo = !!(residentProfile.name || residentProfile.phone);
+  if(hasPersonalInfo && !residentProfile.consent){
+    showToast('이름·전화번호를 첨부하려면 "내 정보 등록"에서 개인정보 수집 동의를 먼저 해주세요', 4000);
+    return;
+  }
+  const includePersonal = residentProfile.consent === true;
   const confirmMsg = `이 내용으로 민원을 접수할까요?\n\n카테고리: ${selectedComplaintCategory}\n제목: ${title}${unit ? '\n동/호수: '+unit : ''}`;
   if(!confirm(confirmMsg)) return;
-  const code = genReceiptCode();
+
+  isSubmitting = true;
+  const btn = document.getElementById('submitBtn');
+  if(btn){ btn.disabled = true; btn.textContent = '접수 중...'; }
+
+  let code = null;
   try{
+    for(let attempt=0; attempt<5; attempt++){
+      const candidate = genReceiptCode();
+      const existing = await db.collection('complaints').doc(candidate).get();
+      if(!existing.exists){ code = candidate; break; }
+    }
+    if(!code){ showToast('접수번호 생성에 실패했어요. 다시 시도해주세요.'); return; }
+
+    let photoUrls = [];
+    try{
+      photoUrls = await uploadPhotos(code, pendingPhotos);
+    }catch(photoErr){
+      showToast('사진 업로드에 실패해서 사진 없이 접수할게요', 4000);
+    }
+
     await db.collection('complaints').doc(code).set({
       category: selectedComplaintCategory,
       zone, unit, title, content,
-      name: residentProfile.name,
-      phone: residentProfile.phone,
-      photos: pendingPhotos.slice(),
+      name: includePersonal ? residentProfile.name : '',
+      phone: includePersonal ? residentProfile.phone : '',
+      photos: photoUrls,
       preferredDate, preferredTime,
       pin,
       status: '접수',
+      statusHistory: [{ status:'접수', at: Date.now() }],
       reply: '',
       createdAt: Date.now()
     });
-    myComplaintIds.push(code);
-    localStorage.setItem('myComplaintIds', JSON.stringify(myComplaintIds));
+
+    try{
+      myComplaintIds.push(code);
+      localStorage.setItem('myComplaintIds', JSON.stringify(myComplaintIds));
+    }catch(storageErr){
+      showToast(`접수는 완료됐어요! 접수번호 ${code} 를 꼭 메모해두세요 (이 기기에 자동 저장은 실패했어요)`, 6000);
+    }
     watchMyComplaint(code);
-  }catch(e){ showToast('접수에 실패했어요. 다시 시도해주세요.'); return; }
-  pendingPhotos = [];
-  if(unit) residentProfile.unit = unit;
-  residentZone = zone;
-  lastReceipt = { code, pin };
-  showToast('민원이 접수되었어요');
-  residentTab = 'mine';
-  render();
+
+    pendingPhotos = [];
+    complaintDraft = { unit:'', title:'', content:'', pin:'', date:'', timeSlot:'' };
+    if(unit) residentProfile.unit = unit;
+    residentZone = zone;
+    try{ localStorage.setItem('residentZone', zone); }catch(e){}
+    lastReceipt = { code, pin };
+    showToast('민원이 접수되었어요');
+    residentTab = 'mine';
+  }catch(e){
+    showToast('접수에 실패했어요. 다시 시도해주세요.');
+  }finally{
+    isSubmitting = false;
+    render();
+  }
 }
 
 function renderManager(){
@@ -1146,9 +1270,7 @@ function renderManager(){
     <div class="card">
       <div class="form-group" style="margin-bottom:10px;">
         <label>담당 구역</label>
-        <select onchange="setManagerZone(this.value)">
-          ${ZONES.map(z=>`<option value="${z.dong}" ${managerZone===z.dong?'selected':''}>${z.dong}</option>`).join('')}
-        </select>
+        <div style="font-family:'Gowun Batang', serif; font-size:17px; color:var(--forest); font-weight:700;">${managerZone}</div>
       </div>
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <div style="font-size:11.5px; color:var(--muted);">${escapeHtml(auth.currentUser.email)}</div>
@@ -1156,7 +1278,7 @@ function renderManager(){
       </div>
     </div>
   `;
-  const zoneComplaintsAll = managerComplaints.filter(c=>c.zone===managerZone);
+  const zoneComplaintsAll = managerComplaints;
   const ACTIVE_STATUSES = ['접수','확인','처리중'];
   const CLOSED_STATUSES = ['처리완료','반려','취소'];
   const activeList = zoneComplaintsAll.filter(c=>ACTIVE_STATUSES.includes(c.status));
@@ -1164,12 +1286,19 @@ function renderManager(){
 
   if(managerTab === 'dashboard'){
     const zoneActivity = activity.filter(a=>a.zone===managerZone);
+    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+    const todayStartMs = todayStart.getTime();
+    const doneToday = zoneComplaintsAll.filter(c =>
+      c.status === '처리완료' &&
+      Array.isArray(c.statusHistory) &&
+      c.statusHistory.some(h => h.status === '처리완료' && h.at >= todayStartMs)
+    ).length;
     screen.innerHTML = zoneSelectHtml + `
-      <h2 class="section-title">오늘 현황 · ${managerZone}</h2>
+      <h2 class="section-title">구역 현황 · ${managerZone}</h2>
       <div class="stat-grid">
         <div class="stat-cell"><div class="label">접수 대기</div><div class="value">${zoneComplaintsAll.filter(c=>c.status==='접수').length}</div></div>
         <div class="stat-cell"><div class="label">처리 중</div><div class="value">${zoneComplaintsAll.filter(c=>c.status==='확인'||c.status==='처리중').length}</div></div>
-        <div class="stat-cell"><div class="label">처리 완료</div><div class="value">${zoneComplaintsAll.filter(c=>c.status==='처리완료').length}</div></div>
+        <div class="stat-cell"><div class="label">오늘 처리완료</div><div class="value">${doneToday}</div></div>
       </div>
 
       <h2 class="section-title">오늘 업무 기록</h2>
@@ -1184,7 +1313,7 @@ function renderManager(){
           <label>메모 (선택)</label>
           <input type="text" id="taskNote" placeholder="예: 1층 복도, 계단 청소 완료">
         </div>
-        <button class="btn" onclick="logActivity()">완료 기록하기</button>
+        <button class="btn" id="logActivityBtn" onclick="logActivity()">완료 기록하기</button>
       </div>
 
       <h2 class="section-title">최근 기록 · ${managerZone}</h2>
@@ -1212,22 +1341,28 @@ function renderManager(){
 function setManagerZone(z){ managerZone = z; render(); }
 
 function managerComplaintHtml(c){
+  const isClosed = ['처리완료','반려','취소'].includes(c.status);
+  const statusControlHtml = isClosed
+    ? `<span class="badge ${c.status}">${c.status}</span>`
+    : `<select onchange="updateStatus('${c.id}', this.value)" style="width:auto; padding:6px 8px; font-size:12px;">
+        ${STATUS_LIST.map(s=>`<option value="${s}" ${c.status===s?'selected':''}>${s}</option>`).join('')}
+      </select>`;
   return `<div class="complaint-item">
     <div class="top">
       <div>
         <div class="cat">${c.category}</div>
         <div class="title">${escapeHtml(c.title)}</div>
-        <div class="unit">${c.unit || '동/호수 미입력'}${c.name ? ' · '+escapeHtml(c.name) : ''}${c.phone ? ' · '+escapeHtml(c.phone) : ''}</div>
+        <div class="unit">${c.unit ? escapeHtml(c.unit) : '동/호수 미입력'}${c.name ? ' · '+escapeHtml(c.name) : ''}${c.phone ? ' · '+escapeHtml(c.phone) : ''}</div>
       </div>
-      <select onchange="updateStatus('${c.id}', this.value)" style="width:auto; padding:6px 8px; font-size:12px;">
-        ${STATUS_LIST.map(s=>`<option value="${s}" ${c.status===s?'selected':''}>${s}</option>`).join('')}
-      </select>
+      ${statusControlHtml}
     </div>
     <div class="content">${escapeHtml(c.content)}</div>
     ${c.preferredDate ? `<div class="unit">📅 희망 방문: ${c.preferredDate}${c.preferredTime ? ' · '+escapeHtml(c.preferredTime) : ''}</div>` : ''}
     ${photoDisplayHtml(c)}
     <div class="form-group" style="margin-top:10px; margin-bottom:0;">
-      <input type="text" placeholder="답변 남기기" value="${c.reply||''}" onchange="updateReply('${c.id}', this.value)">
+      <label style="font-size:11.5px;">답변</label>
+      <textarea id="reply-${c.id}" placeholder="답변을 입력해주세요" style="min-height:60px;">${escapeHtml(c.reply||'')}</textarea>
+      <button class="btn secondary small" style="margin-top:6px;" onclick="updateReply('${c.id}')">답변 저장</button>
     </div>
   </div>`;
 }
@@ -1239,25 +1374,50 @@ async function updateStatus(id, status){
       return;
     }
   }
+  let reasonUpdate = {};
+  if(status === '반려'){
+    const textarea = document.getElementById(`reply-${id}`);
+    const currentReply = textarea ? textarea.value.trim() : '';
+    if(!currentReply){
+      const reason = prompt('반려 사유를 입력해주세요. (입주민에게 그대로 안내돼요)');
+      if(!reason || !reason.trim()){ showToast('반려하려면 사유를 입력해야 해요'); render(); return; }
+      reasonUpdate = { reply: reason.trim() };
+    }
+  }
   try{
-    await db.collection('complaints').doc(id).update({ status });
+    await db.collection('complaints').doc(id).update({
+      status,
+      ...reasonUpdate,
+      statusHistory: firebase.firestore.FieldValue.arrayUnion({ status, at: Date.now() })
+    });
     showToast('상태가 변경되었어요');
   }catch(e){ showToast('변경에 실패했어요'); }
 }
-async function updateReply(id, reply){
+async function updateReply(id){
+  const textarea = document.getElementById(`reply-${id}`);
+  const reply = textarea ? textarea.value : '';
   try{
     await db.collection('complaints').doc(id).update({ reply });
     showToast('답변이 저장되었어요');
   }catch(e){ showToast('저장에 실패했어요'); }
 }
 
+let isLoggingActivity = false;
 async function logActivity(){
+  if(isLoggingActivity) return;
+  isLoggingActivity = true;
+  const btn = document.getElementById('logActivityBtn');
+  if(btn){ btn.disabled = true; btn.textContent = '기록 중...'; }
   const note = document.getElementById('taskNote').value.trim();
   try{
     await db.collection('activity').add({ type: selectedTaskCategory, zone: managerZone, note, timestamp: Date.now() });
     showToast('기록되었어요');
     document.getElementById('taskNote').value = '';
   }catch(e){ showToast('기록에 실패했어요'); }
+  finally{
+    isLoggingActivity = false;
+    if(btn){ btn.disabled = false; btn.textContent = '완료 기록하기'; }
+  }
 }
 
 render();
