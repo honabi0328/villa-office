@@ -133,6 +133,7 @@
 
   .form-group{margin-bottom:14px;}
   .form-group label{display:block; font-size:13px; font-weight:600; margin-bottom:6px; color:var(--forest);}
+  .hint{font-size:11.5px; color:var(--muted); line-height:1.5;}
   input[type=text], textarea, select{
     width:100%;
     font-family:inherit;
@@ -248,6 +249,35 @@
   }
   .lightbox img{max-width:100%; max-height:100%; border-radius:10px;}
 
+  .install-banner{
+    display:none;
+    position:fixed;
+    left:16px; right:16px; bottom:16px;
+    background:var(--forest);
+    color:#fff;
+    border-radius:14px;
+    padding:14px 16px;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    box-shadow:0 8px 24px rgba(0,0,0,0.25);
+    z-index:150;
+    max-width:390px;
+    margin:0 auto;
+  }
+  .install-text{font-size:13px; line-height:1.4;}
+  .install-actions{display:flex; align-items:center; gap:8px; flex-shrink:0;}
+  .install-btn{
+    background:#fff; color:var(--forest);
+    border:none; border-radius:9px;
+    padding:9px 14px; font-size:13px; font-weight:700;
+    cursor:pointer; font-family:inherit;
+  }
+  .install-close{
+    background:transparent; border:none; color:rgba(255,255,255,0.75);
+    font-size:16px; cursor:pointer; padding:4px;
+  }
+
   .empty{text-align:center; color:var(--muted); font-size:13px; padding:30px 10px;}
 
   .tabbar{
@@ -348,6 +378,15 @@
 <div class="toast" id="toast"></div>
 <div class="lightbox" id="lightbox" onclick="closeLightbox()">
   <img id="lightboxImg">
+</div>
+<div id="installBanner" class="install-banner">
+  <div class="install-text">
+    <strong>빌라관리소</strong> 앱을 홈 화면에 설치할까요?
+  </div>
+  <div class="install-actions">
+    <button class="install-btn" onclick="installApp()">설치하기</button>
+    <button class="install-close" onclick="dismissInstallBanner()">✕</button>
+  </div>
 </div>
 
 <script>
@@ -723,6 +762,19 @@ function renderResident(){
           <input type="file" accept="image/*" ${pendingPhotos.length>=MAX_PHOTOS?'disabled':''} onchange="handlePhotoSelect(event)">
           ${photoPreviewHtml()}
         </div>
+        <div class="form-group">
+          <label>희망 방문 시간 (선택)</label>
+          <div style="display:flex; gap:8px;">
+            <input type="date" id="cDate" style="flex:1;">
+            <select id="cTimeSlot" style="flex:1;">
+              <option value="">시간대 무관</option>
+              <option>오전 (07:00~12:00)</option>
+              <option>오후 (12:00~15:00)</option>
+              <option>늦은 오후 (15:00~18:00)</option>
+            </select>
+          </div>
+          <div class="hint" style="margin-top:6px;">운영시간(평일 07:00~18:00) 내에서 희망하시는 시간을 남겨주시면 참고해서 방문할게요.</div>
+        </div>
         <button class="btn" onclick="submitComplaint()">접수하기</button>
       </div>
     `;
@@ -776,6 +828,7 @@ function complaintItemHtml(c){
       <span class="badge ${c.status}">${c.status}</span>
     </div>
     <div class="content">${escapeHtml(c.content)}</div>
+    ${c.preferredDate ? `<div class="unit">📅 희망 방문: ${c.preferredDate}${c.preferredTime ? ' · '+escapeHtml(c.preferredTime) : ''}</div>` : ''}
     ${photoDisplayHtml(c)}
     ${statusTrackerHtml(c.status)}
     ${c.reply ? `<div class="reply">💬 매니저 답변: ${escapeHtml(c.reply)}</div>` : ''}
@@ -803,6 +856,8 @@ async function submitComplaint(){
   const unit = document.getElementById('cUnit').value.trim();
   const title = document.getElementById('cTitle').value.trim();
   const content = document.getElementById('cContent').value.trim();
+  const preferredDate = document.getElementById('cDate').value;
+  const preferredTime = document.getElementById('cTimeSlot').value;
   if(!zone){ showToast('구역을 선택해주세요'); return; }
   if(!title || !content){ showToast('제목과 내용을 입력해주세요'); return; }
   try{
@@ -812,6 +867,7 @@ async function submitComplaint(){
       name: residentProfile.name,
       phone: residentProfile.phone,
       photos: pendingPhotos.slice(),
+      preferredDate, preferredTime,
       status: '접수',
       reply: '',
       createdAt: Date.now()
@@ -897,6 +953,7 @@ function managerComplaintHtml(c){
       </select>
     </div>
     <div class="content">${escapeHtml(c.content)}</div>
+    ${c.preferredDate ? `<div class="unit">📅 희망 방문: ${c.preferredDate}${c.preferredTime ? ' · '+escapeHtml(c.preferredTime) : ''}</div>` : ''}
     ${photoDisplayHtml(c)}
     <div class="form-group" style="margin-top:10px; margin-bottom:0;">
       <input type="text" placeholder="답변 남기기" value="${c.reply||''}" onchange="updateReply('${c.id}', this.value)">
@@ -933,6 +990,27 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   });
 }
+
+// ---- 안드로이드/크롬: 한 번에 설치 버튼 ----
+let deferredInstallPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  document.getElementById('installBanner').style.display = 'flex';
+});
+async function installApp(){
+  if(!deferredInstallPrompt) return;
+  deferredInstallPrompt.prompt();
+  await deferredInstallPrompt.userChoice;
+  deferredInstallPrompt = null;
+  document.getElementById('installBanner').style.display = 'none';
+}
+function dismissInstallBanner(){
+  document.getElementById('installBanner').style.display = 'none';
+}
+window.addEventListener('appinstalled', () => {
+  document.getElementById('installBanner').style.display = 'none';
+});
 </script>
 </body>
 </html>
